@@ -9,30 +9,99 @@ use \ParagonIE\ConstantTime\Binary;
 
 class PasswordLock
 {
+    private const SHA384 = 0;
+    private const SHA3_384 = 1;
+    private const SHA256 = 2;
+    
+    /**
+     * Chooses the best available hashing algorithm for hashing the password.
+     *
+     * @access private
+     * @static
+     * @return int
+     * @throws \Exception
+     */
+    private static function chooseHashAlgo()
+    {
+        if (in_array("sha3-384", $algos = hash_algos())) {
+            return static::SHA3_384;
+        } elseif (in_array("sha384", $algos)) {
+            return static::SHA384;
+        } elseif (in_array("sha256", $algos)) {
+            return static::SHA256;
+        } else {
+            throw new \Exception("No valid hash algos found.");
+        }
+    }
+    
+    /**
+     * Hashes a password.
+     *
+     * @param int $algo
+     * @param string $password
+     * @access private
+     * @static
+     * @return string
+     * @throws \Exception
+     */
+    private static function hash(int $algo, string $password): string
+    {
+        switch ($algo) {
+            case static::SHA384:
+                return \hash('sha384', $password, true);
+            case static::SHA3_384:
+                return \hash('sha3-384', $password, true);
+            case static::SHA256:
+                return \hash('sha256', $password, true);
+            default:
+                throw new \Exception("No valid hash algos found.");
+        }
+    }
+    
     /**
      * 1. Hash password using bcrypt-base64-SHA256
      * 2. Encrypt-then-MAC the hash
      *
      * @param string $password
      * @param Key $aesKey
+     * @param int $passwordAlgo (default: null) PASSWORD_DEFAULT / PASSWORD_ARGON2I
+     * @param ?array $options Options passed to the password_hash function
      * @return string
      * @throws \Exception
      * @throws \InvalidArgumentException
      */
-    public static function hashAndEncrypt(string $password, Key $aesKey): string
-    {
+    public static function hashAndEncrypt(
+        string $password,
+        Key $aesKey,
+        ?int $passwordAlgo = null,
+        ?array $options = null
+    ): string {
+        /** @var int $algo */
+        $algo = static::chooseHashAlgo();
+        
+        if (is_null($passwordAlgo) && defined("PASSWORD_ARGON2I")) {
+            $passwordAlgo = \PASSWORD_ARGON2I;
+        } elseif (is_null($passwordAlgo) && defined("PASSWORD_DEFAULT")) {
+            $passwordAlgo = \PASSWORD_DEFAULT;
+        } elseif (is_null($passwordAlgo)) {
+            throw new \Exception("No valid hash algos for password_hash found.");
+        }
+        
         /** @var string $hash */
         $hash = \password_hash(
             Base64::encode(
-                \hash('sha384', $password, true)
+                static::hash($algo, $password)
             ),
-            PASSWORD_DEFAULT
+            $passwordAlgo,
+            $options ?? []
         );
         if (!\is_string($hash)) {
             throw new \Exception("Unknown hashing error.");
         }
-        return Crypto::encrypt($hash, $aesKey);
+        
+        return Crypto::encrypt("%" . $algo . $hash, $aesKey);
     }
+    
     /**
      * 1. VerifyHMAC-then-Decrypt the ciphertext to get the hash
      * 2. Verify that the password matches the hash
@@ -81,12 +150,20 @@ class PasswordLock
             $ciphertext,
             $aesKey
         );
+        
+        if (strpos($hash, "%") === 0) {
+            $algo = intval(substr($hash, 1, 1));
+            $hash = substr($hash, 2);
+        } else {
+            $algo = static::SHA384;
+        }
+                
         if (!\is_string($hash)) {
             throw new \Exception("Unknown hashing error.");
         }
         return \password_verify(
             Base64::encode(
-                \hash('sha384', $password, true)
+                static::hash($algo, $password)
             ),
             $hash
         );
