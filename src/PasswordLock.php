@@ -201,7 +201,7 @@ class PasswordLock
      */
     public static function decryptAndVerify(string $password, string $ciphertext, Key $aesKey): bool
     {
-        $decrypted = Crypto::decrypt(
+        $hash = Crypto::decrypt(
             $ciphertext,
             $aesKey
         );
