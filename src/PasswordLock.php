@@ -9,113 +9,126 @@ use \ParagonIE\ConstantTime\Binary;
 
 class PasswordLock
 {
-    private const SHA384 = 0;
-    private const SHA3_384 = 1;
-    private const SHA256 = 2;
+    private const HASH_ALGO_NONE = 0;
+    private const HASH_ALGO_SHA256 = 1;
+    private const HASH_ALGO_SHA384 = 2;
+    private const HASH_ALGO_SHA3_384 = 3;
     
     /**
-     * Chooses the best available hashing algorithm for hashing the password.
-     * Note that this is the _prehash_ which is done before base64 and
-     * password_hash.
+     * Return info about the hash
      *
-     * @access private
-     * @static
-     * @return int The constant representing the different algorithms for
-     *             hash()
-     * @throws \Exception
+     * @param string $hash
+     * @return array The hash, the preHashAlgo and the passwordAlgo
      */
-    private static function chooseHashAlgo()
+    private static function getPasswordInfo(string $hash): array
     {
-        if (in_array("sha3-384", $algos = hash_algos())) {
-            return static::SHA3_384;
-        } elseif (in_array("sha384", $algos)) {
-            return static::SHA384;
-        } elseif (in_array("sha256", $algos)) {
-            return static::SHA256;
+        if (strpos($hash, "%") === 0) {
+            $hashAlgo = intval(substr($hash, 1, 1));
+            $hash = substr($hash, 2);
         } else {
-            throw new \Exception("No valid hash algos found.");
+            // This is the default
+            $hashAlgo = static::HASH_ALGO_SHA384;
         }
+        
+        $passwordAlgo = password_get_info($hash)['algo'];
+        
+        return [
+            'hash' => $hash,
+            'preHashAlgo' => $hashAlgo,
+            'passwordAlgo' => $passwordAlgo,
+        ];
     }
     
     /**
-     * Hashes a password.
+     * Determines which hash algo to use for prehashing (if any)
      *
-     * @param int $algo
-     * @param string $password
-     * @access private
-     * @static
-     * @return string
+     * @param int $passwordAlgo
+     * @return int
      * @throws \Exception
      */
-    private static function hash(int $algo, string $password): string
+    private static function getBestPreHashAlgo(int $passwordAlgo): int
     {
-        switch ($algo) {
-            case static::SHA384:
-                return \hash('sha384', $password, true);
-            case static::SHA3_384:
-                return \hash('sha3-384', $password, true);
-            case static::SHA256:
-                return \hash('sha256', $password, true);
-            default:
-                throw new \Exception("No valid hash algos for hash() found.");
+        if ($passwordAlgo == \PASSWORD_ARGON2I) {
+            return static::HASH_ALGO_NONE;
+        } elseif (in_array("sha3-384", ($algos = hash_algos()))) {
+            return static::HASH_ALGO_SHA3_384;
+        } elseif (in_array("sha384", $algos)) {
+            return static::HASH_ALGO_SHA384;
+        } elseif (in_array("sha256", $algos)) {
+            return static::HASH_ALGO_SHA256;
+        } else {
+            throw new \Exception("No suitable hash algos found");
         }
     }
     
     /**
-     * Chooses the best available hashing algorithm for hashing the password.
+     * Determines which algo to use for password hashing
      *
-     * @access private
-     * @static
-     * @return int The constant representing the different algorithms for
-     *             password_hash()
+     * @return int
      * @throws \Exception
      */
-    private static function choosePasswordHashAlgo()
+    private static function getBestPasswordHashAlgo(): int
     {
         if (defined("PASSWORD_ARGON2I")) {
             return \PASSWORD_ARGON2I;
-        } elseif (defined("PASSWORD_DEFAULT")) {
-            return \PASSWORD_DEFAULT;
-        } else {
-            throw new \Exception("No valid hash algos for password_hash() found.");
+        } elseif (defined("PASSWORD_BCRYPT")) {
+            return \PASSWORD_BCRYPT;
         }
     }
     
     /**
-     * Chooses the best available hashing algorithm for hashing the password.
+     * Wrapper for the Base64-SHA prehashing to avoid truncating with bcrypt
      *
-     * @access private
-     * @static
-     * @param string $string The hash, with or without the hash() algo prefix.
-     * @return array[string] The constant representing the algorithm used for
-     *                       hash() and the password hash string.
+     * @param string $password
+     * @param int $preHashAlgo
+     * @return string
      */
-    private static function getAlgoAndHash(string $string): array
+    private static function preHashPassword(string $password, int $preHashAlgo): string
     {
-        if (strpos($string, "%") === 0) {
-            $algo = intval(substr($string, 1, 1));
-            $hash = substr($string, 2);
-        } else {
-            // This is the one used in the implementation prior to the update
-            // where sha3-384 was implemented, so if no algo is chosen, use
-            // sha384
-            $algo = static::SHA384;
-            $hash = $string;
+        switch ($preHashAlgo) {
+            case static::HASH_ALGO_NONE:
+                return $password;
+                break;
+            case static::HASH_ALGO_SHA256:
+                return Base64::encode(\hash('sha256', $password, true));
+                break;
+            case static::HASH_ALGO_SHA3_384:
+                return Base64::encode(\hash('sha3-384', $password, true));
+                break;
+            case static::HASH_ALGO_SHA384:
+            default:
+                return Base64::encode(\hash('sha384', $password, true));
+                break;
         }
-        
-        return [$algo, $hash];
     }
     
     /**
-     * 1. Hash password using bcrypt-base64-prehash
+     * Wrapper for the password_hash function
+     *
+     * @param string $password
+     * @param int $preHashAlgo
+     * @param int $passwordAlgo
+     * @param array $passwordOptions
+     * @return string
+     */
+    private static function hashPassword(
+        string $password,
+        int $preHashAlgo,
+        int $passwordAlgo,
+        array $passwordOptions
+    ): string {
+        $preHashed = static::preHashPassword($password, $preHashAlgo);
+        return '%' . $preHashAlgo . \password_hash($preHashed, $passwordAlgo, $passwordOptions);
+    }
+
+    /**
+     * 1. Hash password using bcrypt-base64-SHA2/3 or argon2i
      * 2. Encrypt-then-MAC the hash
      *
      * @param string $password
      * @param Key $aesKey
-     * @param int $passwordAlgo (default: null) PASSWORD_DEFAULT /
-     *                          PASSWORD_ARGON2I
-     * @param ?array $options (default: null) Options passed to the
-     *                        password_hash function
+     * @param ?int $passwordAlgo (default: null)
+     * @param array $passwordOptions (default: [])
      * @return string
      * @throws \Exception
      * @throws \InvalidArgumentException
@@ -124,24 +137,23 @@ class PasswordLock
         string $password,
         Key $aesKey,
         ?int $passwordAlgo = null,
-        ?array $options = null
+        array $passwordOptions = []
     ): string {
-        /** @var int $algo */
-        $algo = static::chooseHashAlgo();
         
-        /** @var string $hash */
-        $hash = \password_hash(
-            Base64::encode(
-                static::hash($algo, $password)
-            ),
-            $passwordAlgo ?? static::choosePasswordHashAlgo(),
-            $options ?? []
+        $passwordAlgo = $passwordAlgo ?? static::getBestPasswordHashAlgo();
+        $preHashAlgo = static::getBestPreHashAlgo($passwordAlgo);
+
+        $hashedPassword = static::hashPassword(
+            $password,
+            $preHashAlgo,
+            $passwordAlgo,
+            $passwordOptions
         );
-        if (!\is_string($hash)) {
+        
+        if (!\is_string($hashedPassword)) {
             throw new \Exception("Unknown hashing error.");
         }
-        
-        return Crypto::encrypt("%" . $algo . $hash, $aesKey);
+        return Crypto::encrypt($hashedPassword, $aesKey);
     }
     
     /**
@@ -193,32 +205,25 @@ class PasswordLock
             $ciphertext,
             $aesKey
         );
-        
-        list($algo, $hash) = static::getAlgoAndHash($decrypted);
+                
+        list($hash, $preHashAlgo, $passwordAlgo) = array_values(static::getPasswordInfo($hash));
                 
         if (!\is_string($hash)) {
             throw new \Exception("Unknown hashing error.");
         }
         return \password_verify(
-            Base64::encode(
-                static::hash($algo, $password)
-            ),
+            static::preHashPassword($password, $preHashAlgo),
             $hash
         );
     }
     
     /**
-     * 1. VerifyHMAC-then-Decrypt the ciphertext to get the hash
-     * 2. Check if the prehash algo has changed
-     * 3. Check if the password_hash algo has changed
-     * 4. If 2 or 3, return true, else return false
+     * Check if password needs a rehash
      *
      * @param string $ciphertext
      * @param Key $aesKey
-     * @param int $passwordAlgo (default: null) PASSWORD_DEFAULT /
-     *                          PASSWORD_ARGON2I
-     * @param ?array $options (default: null) Options passed to the
-     *                        password_hash function
+     * @param ?int $passwordAlgo (default: null)
+     * @param array $passwordOptions (default: [])
      * @return string
      * @throws \Exception
      * @throws \InvalidArgumentException
@@ -227,32 +232,27 @@ class PasswordLock
         string $ciphertext,
         Key $aesKey,
         ?int $passwordAlgo = null,
-        ?array $options = null
+        array $passwordOptions = []
     ): bool {
-        $decrypted = Crypto::decrypt(
+        $passwordAlgo = $passwordAlgo ?? static::getBestPasswordHashAlgo();
+        $preHashAlgo = static::getBestPreHashAlgo($passwordAlgo);
+        
+        $hash = Crypto::decrypt(
             $ciphertext,
             $aesKey
         );
         
-        list($algo, $hash) = static::getAlgoAndHash($decrypted);
-        
-        if (!\is_string($hash)) {
-            throw new \Exception("Unknown hashing error.");
-        }
-        
-        if ($algo !== static::chooseHashAlgo()) {
-            return true;
-        }
-        
-        if (\password_needs_rehash(
+        list(
             $hash,
-            $passwordAlgo ?? static::choosePasswordHashAlgo(),
-            $options ?? []
-        )) {
+            $existingPreHashAlgo,
+            $existingPasswordAlgo
+        ) = array_values(static::getPasswordInfo($hash));
+        
+        if ($preHashAlgo != $existingPreHashAlgo) {
             return true;
         }
         
-        return false;
+        return password_needs_rehash($hash, $passwordAlgo, $passwordOptions);
     }
 
     /**
